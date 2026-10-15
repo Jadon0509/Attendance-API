@@ -1,0 +1,29 @@
+# REVIEW.md
+
+Defects found in the starter `app/main.py`. All are fixed in the submitted version.
+
+| # | Where | What is wrong | How you'd notice it | How I fixed it |
+|---|---|---|---|---|
+| 1 | `compute_late_minutes` | Shift start is built with `punch_in.replace(hour=...)` in the punch-in's own zone (UTC), not IST, so every result is off by 5h30. | Punch in at 10:05 IST for a 09:30 shift: the function does not return 35. | Shift start is built as an IST datetime on the attendance date. |
+| 2 | `compute_late_minutes` | Floors to minutes *first*, then tests `> 10`. 09:40:01 gives 10, which is not `> 10`, so 0 is returned (should be 10). Sub-second parts are not truncated. | 09:40:01 on a 09:30 shift. 09:40:00.900 must count as 09:40:00. | Compare whole seconds to 600 (`> 600`), then floor to minutes. Instants are truncated to seconds on input. |
+| 3 | `compute_late_minutes` | Shift start is anchored to the punch-in's calendar day, which breaks overnight shifts (22:00-06:00, punch-in at 03:00 belongs to the previous day). | Overnight employee punching in at 03:00. | Anchor on the attendance date from R1, not on the punch-in's own date. |
+| 4 | `compute_work_hours` | Python `round()` is banker's rounding on a binary float; R4 wants half-up. | 3 h 0 min 18 s gives 3.005 h: Python returns 3.0, spec says 3.01. | `Decimal(seconds)/3600` quantized with `ROUND_HALF_UP`. |
+| 5 | `compute_overtime` | No 30-minute minimum (R3); no overnight handling (shift end is always on the punch date); result not floored consistently for the threshold. | Punch out 10 minutes after shift end returns 10 instead of 0. Overnight shift returns negative, clamped to 0. | Floor minutes, return them only when >= 30; add one day to shift end for overnight shifts. |
+| 6 | `compute_*` helpers (design) | Helpers take naive or UTC datetimes and strings of mixed meaning (date_str for overtime, none for late). The signatures cannot express the overnight rule. | Reading the code. | Helpers now take the employee and the attendance date, and one `derive()` function computes all derived fields so punch-in, punch-out and PATCH cannot disagree. |
+| 7 | Config / client | `MongoClient` is not `tz_aware`, so PyMongo returns naive datetimes; arithmetic mixes naive and aware values. | `TypeError: can't subtract offset-naive and offset-aware datetimes`. | `tz_aware=True`, UTC, and explicit ms conversion at the API boundary. |
+| 8 | `EmployeeIn` / `PunchInIn` | No validation: bad `emp_code`, email, shift format, equal shifts, impossible `joined_on`; `status` is any string (`ABSENT` accepted at punch-in); `punched_at` accepts seconds, floats, negatives. | POST with `punched_at: 1783312500` (seconds) creates a 1970 record. | Pydantic patterns/limits, strict integer epoch-ms range, `Literal` statuses, shift_start != shift_end check. |
+| 9 | `create_employee` | Check-then-insert race and no unique index, so duplicates can be created concurrently; `created_at` uses naive local `datetime.now()`; response returns a raw datetime, not epoch ms. | Fire 20 parallel POSTs with the same `emp_code`. | Unique index on `emp_code`; `DuplicateKeyError` -> 409; `created_at` is UTC and returned as ms. |
+| 10 | `list_employees` | `skip = page * page_size` skips the first page; `total` counts the whole collection, ignoring the filter; no sort; no bounds on `page` / `page_size`. | `page=1` returns page 2. Filter by department: `total` is wrong. `page=0` gives a negative skip error (500). | `(page-1)*page_size`, `count_documents(filter)`, sort by `emp_code`, `Query(ge=1, le=100)`. |
+| 11 | `punch_in` | Unknown employee: `emp` is `None`, `emp["shift_start"]` raises `TypeError` -> 500 (should be 404). | POST with an unknown `emp_code`. | `get_employee()` raises 404. |
+| 12 | `punch_in` | Timestamp uses `fromtimestamp()` (server local zone, naive); the date comes from that, not IST (R1); `if body.punched_at` treats 0 as missing; no overnight rule. | Run on a UTC server and punch in at 00:30 IST: the date is the previous day. | UTC datetime from epoch ms, IST date via `attendance_date()` with the overnight rule. |
+| 13 | `punch_in` | Check-then-insert race, and no unique index. Two simultaneous requests both pass `find_one` and both insert. | Parallel identical punch-ins give two 201s and two documents. | Unique `(emp_code, date)` index, `insert_one`, `DuplicateKeyError` -> 409. |
+| 14 | `punch_in` response | Returns an `id` (the ObjectId) and `punch_in` as a datetime; `_id` must never be exposed and instants are epoch ms. | Look at the response body. | `att_out()` serializer. |
+| 15 | `list_attendance` | Loads every matching document into memory, sorts in Python, slices in Python. No tie-break on `emp_code`. No indexes. | 100k records: slow and memory-heavy. | Server-side `sort` + `skip` + `limit`, hinted compound indexes, `count_documents` only when filtered. |
+| 16 | `list_attendance` | No validation of dates or `status`; `date_from > date_to` is accepted; `page=0` yields a negative slice start; response exposes `id` and raw datetimes; legacy records without `history` or `half_day` are returned as-is. | `date_from=2026-07-09&date_to=2026-07-01`; `page=0`. | Validation (422), `att_out()` fills defaults and converts to ms. |
+| 17 | `health` | Always returns ok, even if MongoDB is down. | Stop MongoDB, call `/health`. | Pings MongoDB; 503 on failure. |
+| 18 | Startup | No indexes are created at all. | `explain` shows COLLSCAN everywhere. | `ensure_indexes()` at startup, idempotent (also retried from `/health`). |
+
+## Looked at and decided it was fine
+- `load_dotenv()` with its default `override=False`: real environment variables already win over `.env`.
+- A synchronous `MongoClient` shared by sync endpoints: PyMongo is thread-safe and FastAPI runs sync endpoints in a thread pool.
+- Using `emp_code` (not `_id`) as the identity in all queries.
